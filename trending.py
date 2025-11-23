@@ -612,9 +612,10 @@ def initialize_app():
     events_thread.start()
     print("✓ Events background updates started\n")
 
+initialize_app()
 
 if __name__ == '__main__':
-    initialize_app()
+
     
     print("=" * 60)
     print("🚀 Polymarket Events API Server")
