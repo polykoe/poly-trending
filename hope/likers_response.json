@@ -1,0 +1,14 @@
+{
+  "data": {
+    "favoriters_timeline": {
+      "timeline": {
+        "instructions": [
+          {
+            "type": "TimelineTerminateTimeline",
+            "direction": "Bottom"
+          }
+        ]
+      }
+    }
+  }
+}
