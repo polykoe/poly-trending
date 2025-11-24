@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask import Flask, Response
 import requests
 import json
 from typing import List, Dict
@@ -8,9 +9,34 @@ from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import sys
+import gzip
 
 app = Flask(__name__)
 CORS(app)
+
+# Add response compression
+@app.after_request
+def compress_response(response):
+    """Compress responses if they're large"""
+    accept_encoding = request.headers.get('Accept-Encoding', '')
+    
+    if 'gzip' not in accept_encoding.lower():
+        return response
+    
+    if response.status_code < 200 or response.status_code >= 300:
+        return response
+    
+    # Only compress if response is larger than 1KB
+    if len(response.data) < 1000:
+        return response
+    
+    # Compress the response
+    gzip_buffer = gzip.compress(response.data)
+    response.data = gzip_buffer
+    response.headers['Content-Encoding'] = 'gzip'
+    response.headers['Content-Length'] = len(response.data)
+    
+    return response
 
 # Cache for events data
 events_cache = {
@@ -285,12 +311,40 @@ def get_remaining_events():
             'initializing': True
         })
     
+    # Add limit parameter to prevent massive responses
+    limit = int(request.args.get('limit', 100))  # Default 100, max 500
+    if limit > 500:
+        limit = 500
+    
     events = get_cached_events()
     if len(events) > 1:
+        # Strip markets from remaining events to reduce size
+        remaining = events[1:limit+1]  # +1 because we skip the first one
+        
+        # Optionally strip out heavy fields
+        stripped = [
+            {
+                'rank': e['rank'],
+                'id': e['id'],
+                'title': e['title'],
+                'slug': e['slug'],
+                'link': e['link'],
+                'image': e['image'],
+                'tags': e.get('tags', []),
+                'tag_labels': e.get('tag_labels', []),
+                'volume': e['volume'],
+                'volume_24hr': e.get('volume_24hr', 0),
+                'liquidity': e['liquidity'],
+                'market_count': e.get('market_count', 0),
+                'category': e.get('category')
+            }
+            for e in remaining
+        ]
+        
         return jsonify({
             'success': True,
-            'data': events[1:],
-            'count': len(events) - 1,
+            'data': stripped,
+            'count': len(stripped),
             'timestamp': time.time()
         })
     else:
@@ -304,12 +358,13 @@ def get_remaining_events():
 def get_paginated_markets():
     try:
         offset = int(request.args.get('offset', 0))
-        limit = int(request.args.get('limit', 100))
+        limit = int(request.args.get('limit', 50))  # Reduced default from 100 to 50
+        include_markets = request.args.get('include_markets', 'false').lower() == 'true'
         
         if offset < 0:
             offset = 0
-        if limit < 1 or limit > 500:
-            limit = 100
+        if limit < 1 or limit > 200:  # Max 200
+            limit = 50
         
         if not events_cache.get('initialized', False):
             return jsonify({
@@ -326,6 +381,30 @@ def get_paginated_markets():
         
         paginated_events = events[start_idx:end_idx]
         has_more = end_idx < len(events)
+        
+        # Strip out markets array unless explicitly requested
+        if not include_markets:
+            paginated_events = [
+                {
+                    'rank': e['rank'],
+                    'id': e['id'],
+                    'title': e['title'],
+                    'slug': e['slug'],
+                    'link': e['link'],
+                    'image': e['image'],
+                    'tags': e['tags'],
+                    'tag_labels': e['tag_labels'],
+                    'volume': e['volume'],
+                    'volume_24hr': e['volume_24hr'],
+                    'liquidity': e['liquidity'],
+                    'description': e.get('description', ''),
+                    'end_date': e.get('end_date'),
+                    'market_count': e['market_count'],
+                    'category': e.get('category')
+                    # markets array excluded - reduces response by 80%+
+                }
+                for e in paginated_events
+            ]
         
         return jsonify({
             'success': True,
