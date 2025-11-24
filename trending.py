@@ -1,192 +1,271 @@
-# ============================================
-# backend.py - Flask Backend for Events Only
-# FIXED: Now returns ALL markets, not just 5
-# ============================================
-
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
 import json
-import threading
+from typing import List, Dict
 import time
+from threading import Thread, Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+import sys
 
 app = Flask(__name__)
 CORS(app)
 
-# Global variables
-cached_events = []
-last_update = 0
-UPDATE_INTERVAL = 300
+# Cache for events data
+events_cache = {
+    'data': [],
+    'last_updated': 0,
+    'lock': Lock(),
+    'is_updating': False,
+    'initialized': False
+}
 
-# Configuration
+CACHE_DURATION = 300
+background_thread = None
+init_lock = Lock()
+
 gamma_api_url = "https://gamma-api.polymarket.com"
 clob_api_url = "https://clob.polymarket.com"
 
-
-def get_all_trending_events():
-    """Get ALL trending EVENTS by fetching multiple pages"""
-    try:
-        all_events = []
-        offset = 0
-        limit = 100
-        
-        print("Starting to fetch all events...")
-        
-        while True:
-            url = "https://gamma-api.polymarket.com/events"
-            params = {
-                "active": True,
-                "closed": False,
-                "limit": limit,
-                "offset": offset,
-                "order": "volume",
-                "ascending": False
-            }
-            
-            try:
-                response = requests.get(url, params=params, timeout=15)
-                response.raise_for_status()
-                batch = response.json()
-                
-                if not batch or len(batch) == 0:
-                    break
-                
-                print(f"Fetched {len(batch)} events at offset {offset}")
-                all_events.extend(batch)
-                
-                if len(batch) < limit:
-                    break
-                
-                offset += limit
-                
-                if offset >= 10000:
-                    break
-                
-                time.sleep(0.1)
-                
-            except Exception as e:
-                print(f"Error fetching batch at offset {offset}: {e}")
-                break
-        
-        formatted_events = []
-        
-        for i, event in enumerate(all_events, 1):
-            tags_list = event.get('tags', [])
-            markets = event.get('markets', [])
-            
-            volume = event.get('volume', 0)
-            if isinstance(volume, str):
-                try:
-                    volume = float(volume)
-                except (ValueError, TypeError):
-                    volume = 0
-            
-            volume_24hr = event.get('volume24hr', 0)
-            if isinstance(volume_24hr, str):
-                try:
-                    volume_24hr = float(volume_24hr)
-                except (ValueError, TypeError):
-                    volume_24hr = 0
-            
-            liquidity = event.get('liquidity', 0)
-            if isinstance(liquidity, str):
-                try:
-                    liquidity = float(liquidity)
-                except (ValueError, TypeError):
-                    liquidity = 0
-            
-            formatted_event = {
-                'rank': i,
-                'id': event.get('id'),
-                'title': event.get('title'),
-                'slug': event.get('slug'),
-                'link': f"https://polymarket.com/event/{event.get('slug')}",
-                'image': event.get('image') or event.get('icon') or 'https://via.placeholder.com/150',
-                'tags': [
-                    {
-                        'id': tag.get('id'),
-                        'label': tag.get('label'),
-                        'slug': tag.get('slug')
-                    }
-                    for tag in tags_list
-                ],
-                'tag_labels': [tag.get('label') for tag in tags_list],
-                'volume': volume,
-                'volume_24hr': volume_24hr,
-                'liquidity': liquidity,
-                'description': event.get('description', ''),
-                'end_date': event.get('endDate'),
-                'market_count': len(markets),
-                'category': event.get('category'),
-                # ✅ FIXED: Return ALL markets, not just first 5
-                # Also ensure each market includes its image/icon
-                'markets': [
-                    {
-                        **market,
-                        'image': market.get('image') or market.get('icon') or event.get('image') or event.get('icon'),
-                    }
-                    for market in markets
-                ]  # Returns all markets now with images!
-            }
-            
-            formatted_events.append(formatted_event)
-        
-        print(f"✓ Total events fetched and formatted: {len(formatted_events)}")
-        return formatted_events
+def fetch_all_trending_events() -> List[Dict]:
+    """Fetches all trending events using parallel requests"""
+    base_url = f"{gamma_api_url}/events"
+    all_events = []
+    limit = 100
     
-    except Exception as e:
-        print(f"Error fetching events: {e}")
-        return []
-
-
-def update_events_background():
-    global cached_events, last_update
+    print(f"[PID {os.getpid()}] 🔄 Fetching events from Polymarket (parallel)...", flush=True)
+    start_time = time.time()
     
-    while True:
+    # Generate offsets for parallel fetching (estimating max 5000 events)
+    offsets = list(range(0, 5000, limit))
+    
+    def fetch_batch(offset):
+        """Fetch a single batch of events"""
+        params = {
+            "active": True,
+            "closed": False,
+            "limit": limit,
+            "offset": offset,
+            "order": "volume",
+            "ascending": False
+        }
+        
         try:
-            print("\n" + "="*60)
-            print("Fetching latest events data...")
-            events = get_all_trending_events()
+            response = requests.get(base_url, params=params, timeout=15)
+            response.raise_for_status()
+            events = response.json()
             
-            if events:
-                cached_events = events
-                last_update = time.time()
-                print(f"✓ Updated {len(events)} events at {time.ctime()}")
-                print("="*60 + "\n")
-            else:
-                print("⚠ No events fetched, keeping cached data")
-        
+            if not events:
+                return []
+            
+            return events
+            
         except Exception as e:
-            print(f"Error in background update: {e}")
+            print(f"[PID {os.getpid()}] ❌ Error fetching at offset {offset}: {e}", flush=True)
+            return []
+    
+    # Fetch in parallel with 10 concurrent workers
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_batch, offset): offset for offset in offsets}
         
-        time.sleep(UPDATE_INTERVAL)
+        completed = 0
+        for future in as_completed(futures):
+            batch_events = future.result()
+            if batch_events:
+                all_events.extend(batch_events)
+                completed += 1
+                
+                # Progress indicator every 5 batches
+                if completed % 5 == 0:
+                    print(f"[PID {os.getpid()}] ... fetched {len(all_events)} events so far ({completed} batches)", flush=True)
+            else:
+                # Empty batch means we've reached the end
+                break
+    
+    # Format events
+    formatted_events = []
+    for i, event in enumerate(all_events, 1):
+        tags_list = event.get('tags', [])
+        markets = event.get('markets', [])
+        
+        volume = event.get('volume', 0)
+        if isinstance(volume, str):
+            try:
+                volume = float(volume)
+            except (ValueError, TypeError):
+                volume = 0
+        
+        volume_24hr = event.get('volume24hr', 0)
+        if isinstance(volume_24hr, str):
+            try:
+                volume_24hr = float(volume_24hr)
+            except (ValueError, TypeError):
+                volume_24hr = 0
+        
+        liquidity = event.get('liquidity', 0)
+        if isinstance(liquidity, str):
+            try:
+                liquidity = float(liquidity)
+            except (ValueError, TypeError):
+                liquidity = 0
+        
+        formatted_event = {
+            'rank': i,
+            'id': event.get('id'),
+            'title': event.get('title'),
+            'slug': event.get('slug'),
+            'link': f"https://polymarket.com/event/{event.get('slug')}",
+            'image': event.get('image') or event.get('icon') or 'https://via.placeholder.com/150',
+            'tags': [
+                {
+                    'id': tag.get('id'),
+                    'label': tag.get('label'),
+                    'slug': tag.get('slug')
+                }
+                for tag in tags_list
+            ],
+            'tag_labels': [tag.get('label') for tag in tags_list],
+            'volume': volume,
+            'volume_24hr': volume_24hr,
+            'liquidity': liquidity,
+            'description': event.get('description', ''),
+            'end_date': event.get('endDate'),
+            'market_count': len(markets),
+            'category': event.get('category'),
+            'markets': [
+                {
+                    **market,
+                    'image': market.get('image') or market.get('icon') or event.get('image') or event.get('icon'),
+                }
+                for market in markets
+            ]
+        }
+        
+        formatted_events.append(formatted_event)
+    
+    elapsed = time.time() - start_time
+    print(f"[PID {os.getpid()}] ✅ Fetched {len(formatted_events)} events in {elapsed:.1f}s", flush=True)
+    return formatted_events
 
+def update_events_cache():
+    """Update cache without blocking reads"""
+    with events_cache['lock']:
+        if events_cache['is_updating']:
+            print(f"[PID {os.getpid()}] ⏭️  Already updating, skipping", flush=True)
+            return
+        events_cache['is_updating'] = True
+    
+    try:
+        new_data = fetch_all_trending_events()
+        
+        with events_cache['lock']:
+            events_cache['data'] = new_data
+            events_cache['last_updated'] = time.time()
+            events_cache['is_updating'] = False
+            events_cache['initialized'] = True
+            
+        print(f"[PID {os.getpid()}] ✅ Cache updated: {len(new_data)} events", flush=True)
+        
+    except Exception as e:
+        print(f"[PID {os.getpid()}] ❌ Error updating cache: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        with events_cache['lock']:
+            events_cache['is_updating'] = False
 
-# ============================================
-# API Endpoints
-# ============================================
+def background_updater():
+    """Background thread for cache updates"""
+    print(f"[PID {os.getpid()}] 🔄 Background updater started", flush=True)
+    while True:
+        time.sleep(CACHE_DURATION)
+        print(f"[PID {os.getpid()}] 🔄 Background refresh triggered", flush=True)
+        update_events_cache()
+
+def ensure_initialized():
+    """Initialize worker on first request"""
+    global background_thread
+    
+    # Quick check without lock
+    if events_cache.get('initialized', False) and background_thread and background_thread.is_alive():
+        return
+    
+    with init_lock:
+        # Double-check with lock
+        if events_cache.get('initialized', False) and background_thread and background_thread.is_alive():
+            return
+        
+        print(f"\n{'='*60}", flush=True)
+        print(f"🚀 INITIALIZING WORKER (PID: {os.getpid()})", flush=True)
+        print(f"{'='*60}", flush=True)
+        
+        # Initial data load
+        update_events_cache()
+        
+        # Start background thread
+        background_thread = Thread(target=background_updater, daemon=True, name=f"updater-{os.getpid()}")
+        background_thread.start()
+        
+        print(f"✅ Worker {os.getpid()} ready with {len(events_cache['data'])} events", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+@app.before_request
+def before_request():
+    """Initialize on first request"""
+    ensure_initialized()
+
+def get_cached_events() -> List[Dict]:
+    """Get events from cache"""
+    current_time = time.time()
+    
+    should_update = False
+    with events_cache['lock']:
+        if (current_time - events_cache['last_updated'] > CACHE_DURATION and 
+            not events_cache['is_updating']):
+            should_update = True
+    
+    if should_update:
+        thread = Thread(target=update_events_cache, daemon=True)
+        thread.start()
+    
+    with events_cache['lock']:
+        return events_cache['data'].copy()
 
 @app.route('/api/events', methods=['GET'])
 def get_events():
+    if not events_cache.get('initialized', False):
+        return jsonify({
+            'success': True,
+            'data': [],
+            'count': 0,
+            'message': 'Loading events, please try again in a moment...',
+            'initializing': True
+        })
+    
+    events = get_cached_events()
     return jsonify({
         'success': True,
-        'data': cached_events,
-        'count': len(cached_events),
-        'last_update': last_update,
+        'data': events,
+        'count': len(events),
+        'last_update': events_cache['last_updated'],
         'timestamp': time.time()
     })
 
-
 @app.route('/api/events/featured', methods=['GET'])
 def get_featured_event():
-    if cached_events:
+    if not events_cache.get('initialized', False):
         return jsonify({
             'success': True,
-            'data': cached_events[0],
+            'data': None,
+            'message': 'Loading events...',
+            'initializing': True
+        })
+    
+    events = get_cached_events()
+    if events:
+        return jsonify({
+            'success': True,
+            'data': events[0],
             'timestamp': time.time()
         })
     else:
@@ -196,14 +275,22 @@ def get_featured_event():
             'timestamp': time.time()
         }), 404
 
-
 @app.route('/api/events/remaining', methods=['GET'])
 def get_remaining_events():
-    if len(cached_events) > 1:
+    if not events_cache.get('initialized', False):
         return jsonify({
             'success': True,
-            'data': cached_events[1:],
-            'count': len(cached_events) - 1,
+            'data': [],
+            'message': 'Loading events...',
+            'initializing': True
+        })
+    
+    events = get_cached_events()
+    if len(events) > 1:
+        return jsonify({
+            'success': True,
+            'data': events[1:],
+            'count': len(events) - 1,
             'timestamp': time.time()
         })
     else:
@@ -212,7 +299,6 @@ def get_remaining_events():
             'error': 'Not enough events available',
             'timestamp': time.time()
         }), 404
-
 
 @app.route('/api/markets/paginated', methods=['GET'])
 def get_paginated_markets():
@@ -225,11 +311,21 @@ def get_paginated_markets():
         if limit < 1 or limit > 500:
             limit = 100
         
+        if not events_cache.get('initialized', False):
+            return jsonify({
+                'success': True,
+                'data': [],
+                'message': 'Loading events...',
+                'initializing': True
+            })
+        
+        events = get_cached_events()
+        
         start_idx = offset
         end_idx = offset + limit
         
-        paginated_events = cached_events[start_idx:end_idx]
-        has_more = end_idx < len(cached_events)
+        paginated_events = events[start_idx:end_idx]
+        has_more = end_idx < len(events)
         
         return jsonify({
             'success': True,
@@ -237,7 +333,7 @@ def get_paginated_markets():
             'count': len(paginated_events),
             'offset': offset,
             'limit': limit,
-            'total': len(cached_events),
+            'total': len(events),
             'has_more': has_more,
             'timestamp': time.time()
         })
@@ -249,12 +345,11 @@ def get_paginated_markets():
             'timestamp': time.time()
         }), 500
 
-
 @app.route('/api/market/<slug>/chart', methods=['GET'])
 def get_market_chart(slug):
     """Get chart data with ALL outcomes and their probabilities"""
     try:
-        events_endpoint = f"https://gamma-api.polymarket.com/events/slug/{slug}"
+        events_endpoint = f"{gamma_api_url}/events/slug/{slug}"
         response = requests.get(events_endpoint, timeout=10)
         
         if response.status_code != 200:
@@ -313,7 +408,7 @@ def get_market_chart(slug):
         for idx, token_id in enumerate(clob_token_ids):
             outcome_name = outcomes[idx] if idx < len(outcomes) else f"Outcome {idx+1}"
             
-            clob_url = "https://clob.polymarket.com/prices-history"
+            clob_url = f"{clob_api_url}/prices-history"
             params = {'market': token_id, 'interval': interval, 'fidelity': 100}
             
             try:
@@ -347,16 +442,15 @@ def get_market_chart(slug):
         print(f"Error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
 @app.route('/api/market/<slug>', methods=['GET'])
 def get_market_by_slug(slug):
     """Get detailed information about a specific market by slug"""
     try:
-        # First check if it's in our cached events
-        market_from_cache = next((event for event in cached_events if event.get('slug') == slug), None)
+        # First check cache
+        events = get_cached_events()
+        market_from_cache = next((event for event in events if event.get('slug') == slug), None)
         
         if market_from_cache:
-            print(f"✅ Found '{slug}' in cache with {len(market_from_cache.get('markets', []))} markets")
             return jsonify({
                 'success': True,
                 'data': market_from_cache,
@@ -364,12 +458,7 @@ def get_market_by_slug(slug):
                 'timestamp': time.time()
             })
         
-        # If not in cache, fetch from Polymarket API
-        print(f"\n{'='*60}")
-        print(f"Fetching market details for slug: {slug}")
-        print('='*60)
-        
-        # Fetch from Polymarket Gamma API
+        # If not in cache, fetch from API
         gamma_response = requests.get(
             f"{gamma_api_url}/events",
             params={'slug': slug},
@@ -377,7 +466,6 @@ def get_market_by_slug(slug):
         )
         
         if gamma_response.status_code != 200:
-            print(f"❌ Event not found: {gamma_response.status_code}")
             return jsonify({
                 'success': False,
                 'error': 'Market not found',
@@ -386,7 +474,6 @@ def get_market_by_slug(slug):
         
         events_data = gamma_response.json()
         
-        # The API returns an array, get the first item
         if not events_data or len(events_data) == 0:
             return jsonify({
                 'success': False,
@@ -443,14 +530,8 @@ def get_market_by_slug(slug):
             'end_date': event.get('endDate'),
             'market_count': len(markets),
             'category': event.get('category'),
-            'markets': markets  # ✅ Include ALL markets
+            'markets': markets
         }
-        
-        print(f"✅ Successfully fetched market: {formatted_event['title']}")
-        print(f"   - Volume: ${volume:,.2f}")
-        print(f"   - Liquidity: ${liquidity:,.2f}")
-        print(f"   - Markets: {len(markets)}")
-        print('='*60 + '\n')
         
         return jsonify({
             'success': True,
@@ -459,29 +540,19 @@ def get_market_by_slug(slug):
             'timestamp': time.time()
         })
     
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Network error fetching market: {e}")
-        return jsonify({
-            'success': False,
-            'error': 'Failed to fetch market data from Polymarket',
-            'timestamp': time.time()
-        }), 500
-    
     except Exception as e:
-        print(f"❌ Error fetching market: {e}")
         return jsonify({
             'success': False,
             'error': str(e),
             'timestamp': time.time()
         }), 500
 
-
 @app.route('/api/market/<slug>/related', methods=['GET'])
 def get_related_markets(slug):
     """Get related markets based on tags"""
     try:
-        # First get the main market
-        market = next((event for event in cached_events if event.get('slug') == slug), None)
+        events = get_cached_events()
+        market = next((event for event in events if event.get('slug') == slug), None)
         
         if not market:
             return jsonify({
@@ -490,7 +561,6 @@ def get_related_markets(slug):
                 'timestamp': time.time()
             }), 404
         
-        # Get tags from the market
         market_tags = set(market.get('tag_labels', []))
         
         if not market_tags:
@@ -501,16 +571,13 @@ def get_related_markets(slug):
                 'timestamp': time.time()
             })
         
-        # Find related markets with similar tags
         related_markets = []
         
-        for event in cached_events:
+        for event in events:
             if event.get('slug') == slug:
-                continue  # Skip the current market
+                continue
             
             event_tags = set(event.get('tag_labels', []))
-            
-            # Calculate tag overlap
             common_tags = market_tags.intersection(event_tags)
             
             if common_tags:
@@ -519,13 +586,11 @@ def get_related_markets(slug):
                 event_copy['matching_tags'] = list(common_tags)
                 related_markets.append(event_copy)
         
-        # Sort by match score and volume
         related_markets.sort(
             key=lambda x: (x.get('match_score', 0), x.get('volume', 0)),
             reverse=True
         )
         
-        # Return top 10 related markets
         related_markets = related_markets[:10]
         
         return jsonify({
@@ -536,101 +601,40 @@ def get_related_markets(slug):
         })
     
     except Exception as e:
-        print(f"Error fetching related markets: {e}")
         return jsonify({
             'success': False,
             'error': str(e),
             'timestamp': time.time()
         }), 500
-
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
+    with events_cache['lock']:
+        cache_age = time.time() - events_cache['last_updated']
+        is_updating = events_cache['is_updating']
+        initialized = events_cache.get('initialized', False)
+        cache_size = len(events_cache['data'])
+    
+    is_alive = background_thread is not None and background_thread.is_alive()
+    
     return jsonify({
-        'status': 'healthy',
-        'events_count': len(cached_events),
-        'last_update': last_update,
-        'last_update_time': time.ctime(last_update) if last_update else 'Never',
-        'timestamp': time.time()
+        'success': True,
+        'status': 'healthy' if initialized else 'initializing',
+        'initialized': initialized,
+        'cache_size': cache_size,
+        'cache_age_seconds': cache_age,
+        'is_updating': is_updating,
+        'background_thread_alive': is_alive,
+        'worker_pid': os.getpid()
     })
-
 
 @app.route('/api/refresh', methods=['POST'])
 def force_refresh():
-    global cached_events, last_update
+    thread = Thread(target=update_events_cache, daemon=True)
+    thread.start()
     
-    try:
-        events = get_all_trending_events()
-        
-        if events:
-            cached_events = events
-            last_update = time.time()
-            
-            return jsonify({
-                'success': True,
-                'message': 'Events refreshed successfully',
-                'count': len(events),
-                'timestamp': time.time()
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to fetch events',
-                'timestamp': time.time()
-            }), 500
-    
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'timestamp': time.time()
-        }), 500
-
-
-def initialize_app():
-    global cached_events, last_update
-    
-    print("\n" + "="*60)
-    print("Initializing app...")
-    print("="*60)
-    print("Fetching ALL events data...")
-    
-    events = get_all_trending_events()
-    
-    if events:
-        cached_events = events
-        last_update = time.time()
-        print(f"\n✓ Successfully loaded {len(events)} events!")
-        print("="*60 + "\n")
-    else:
-        print("\n⚠ Failed to load initial data")
-        print("="*60 + "\n")
-    
-    print("Starting background thread...")
-    
-    events_thread = threading.Thread(target=update_events_background, daemon=True)
-    events_thread.start()
-    print("✓ Events background updates started\n")
-
-initialize_app()
+    return jsonify({'success': True, 'message': 'Cache refresh initiated'})
 
 if __name__ == '__main__':
-
-    
-    print("=" * 60)
-    print("🚀 Polymarket Events API Server")
-    print("=" * 60)
-    print("\nEndpoints:")
-    print("  GET  /api/events")
-    print("  GET  /api/events/featured")
-    print("  GET  /api/events/remaining")
-    print("  GET  /api/markets/paginated")
-    print("  GET  /api/market/<slug>")
-    print("  GET  /api/market/<slug>/chart")
-    print("  GET  /api/market/<slug>/related")
-    print("  GET  /api/health")
-    print("  POST /api/refresh")
-    print("\nRunning on: http://localhost:8100")
-    print("=" * 60 + "\n")
-    
+    ensure_initialized()
     app.run(debug=True, host='0.0.0.0', port=8100)
