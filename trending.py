@@ -311,15 +311,18 @@ def get_remaining_events():
             'initializing': True
         })
     
-    # Add limit parameter to prevent massive responses
-    limit = int(request.args.get('limit', 100))  # Default 100, max 500
-    if limit > 500:
+    # Optional: keep limit parameter for frontend flexibility, but default to all
+    limit = int(request.args.get('limit', 0))  # 0 = no limit
+    if limit > 0 and limit > 500:
         limit = 500
     
     events = get_cached_events()
     if len(events) > 1:
         # Strip markets from remaining events to reduce size
-        remaining = events[1:limit+1]  # +1 because we skip the first one
+        if limit > 0:
+            remaining = events[1:limit+1]
+        else:
+            remaining = events[1:]  # Return ALL events
         
         # Optionally strip out heavy fields
         stripped = [
