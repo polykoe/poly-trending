@@ -311,20 +311,17 @@ def get_remaining_events():
             'initializing': True
         })
     
-    # Optional: keep limit parameter for frontend flexibility, but default to all
-    limit = int(request.args.get('limit', 0))  # 0 = no limit
-    if limit > 0 and limit > 500:
-        limit = 500
+    # Return a reasonable default (e.g., next 50 events after featured)
+    # Frontend should use /api/markets/paginated for loading more
+    limit = int(request.args.get('limit', 50))  # Default to 50
+    if limit > 200:
+        limit = 200  # Cap at 200 for this endpoint
     
     events = get_cached_events()
     if len(events) > 1:
-        # Strip markets from remaining events to reduce size
-        if limit > 0:
-            remaining = events[1:limit+1]
-        else:
-            remaining = events[1:]  # Return ALL events
+        remaining = events[1:limit+1]
         
-        # Optionally strip out heavy fields
+        # Strip out heavy fields
         stripped = [
             {
                 'rank': e['rank'],
@@ -348,6 +345,7 @@ def get_remaining_events():
             'success': True,
             'data': stripped,
             'count': len(stripped),
+            'total_available': len(events) - 1,
             'timestamp': time.time()
         })
     else:
