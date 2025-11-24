@@ -7,9 +7,34 @@ import time
 from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor
 import os
+import gzip
 
 app = Flask(__name__)
 CORS(app)
+
+# Add response compression for large JSON payloads
+@app.after_request
+def compress_response(response):
+    """Compress responses if they're large enough"""
+    accept_encoding = request.headers.get('Accept-Encoding', '')
+    
+    if 'gzip' not in accept_encoding.lower():
+        return response
+    
+    if response.status_code < 200 or response.status_code >= 300:
+        return response
+    
+    # Only compress if response is larger than 1KB
+    if len(response.data) < 1000:
+        return response
+    
+    # Compress the response
+    gzip_buffer = gzip.compress(response.data)
+    response.data = gzip_buffer
+    response.headers['Content-Encoding'] = 'gzip'
+    response.headers['Content-Length'] = len(response.data)
+    
+    return response
 
 # Cache for events data
 events_cache = {
@@ -269,6 +294,7 @@ def get_featured_event():
 
 @app.route('/api/events/remaining', methods=['GET'])
 def get_remaining_events():
+    """Get remaining events with pagination - NEVER return all events at once"""
     if not events_cache.get('initialized', False):
         return jsonify({
             'success': True,
@@ -277,30 +303,74 @@ def get_remaining_events():
             'initializing': True
         })
     
+    # Force pagination with reasonable defaults
+    limit = int(request.args.get('limit', 100))  # Default 100
+    offset = int(request.args.get('offset', 1))  # Start at index 1 (skip featured)
+    
+    if limit > 200:
+        limit = 200  # Hard cap at 200
+    if offset < 1:
+        offset = 1
+    
     events = get_cached_events()
-    if len(events) > 1:
+    
+    if len(events) <= offset:
         return jsonify({
             'success': True,
-            'data': events[1:],
-            'count': len(events) - 1,
+            'data': [],
+            'count': 0,
+            'has_more': False,
             'timestamp': time.time()
         })
-    else:
-        return jsonify({
-            'success': False,
-            'error': 'Not enough events available',
-            'timestamp': time.time()
-        }), 404
+    
+    # Get slice of events
+    end_idx = offset + limit
+    remaining = events[offset:end_idx]
+    has_more = end_idx < len(events)
+    
+    # Strip heavy fields (markets array)
+    stripped = [
+        {
+            'rank': e['rank'],
+            'id': e['id'],
+            'title': e['title'],
+            'slug': e['slug'],
+            'link': e['link'],
+            'image': e['image'],
+            'tags': e.get('tags', []),
+            'tag_labels': e.get('tag_labels', []),
+            'volume': e['volume'],
+            'volume_24hr': e.get('volume_24hr', 0),
+            'liquidity': e['liquidity'],
+            'market_count': e.get('market_count', 0),
+            'category': e.get('category'),
+            'description': e.get('description', '')[:200] if e.get('description') else ''
+        }
+        for e in remaining
+    ]
+    
+    return jsonify({
+        'success': True,
+        'data': stripped,
+        'count': len(stripped),
+        'offset': offset,
+        'limit': limit,
+        'total_available': len(events) - 1,  # Exclude featured
+        'has_more': has_more,
+        'timestamp': time.time()
+    })
 
 @app.route('/api/markets/paginated', methods=['GET'])
 def get_paginated_markets():
+    """Paginated markets endpoint - strips markets array by default for performance"""
     try:
         offset = int(request.args.get('offset', 0))
         limit = int(request.args.get('limit', 100))
+        include_markets = request.args.get('include_markets', 'false').lower() == 'true'
         
         if offset < 0:
             offset = 0
-        if limit < 1 or limit > 500:
+        if limit < 1 or limit > 200:  # Reduced max from 500 to 200
             limit = 100
         
         if not events_cache.get('initialized', False):
@@ -318,6 +388,28 @@ def get_paginated_markets():
         
         paginated_events = events[start_idx:end_idx]
         has_more = end_idx < len(events)
+        
+        # Strip markets array by default for performance
+        if not include_markets:
+            paginated_events = [
+                {
+                    'rank': e['rank'],
+                    'id': e['id'],
+                    'title': e['title'],
+                    'slug': e['slug'],
+                    'link': e['link'],
+                    'image': e['image'],
+                    'tags': e.get('tags', []),
+                    'tag_labels': e.get('tag_labels', []),
+                    'volume': e['volume'],
+                    'volume_24hr': e.get('volume_24hr', 0),
+                    'liquidity': e['liquidity'],
+                    'market_count': e.get('market_count', 0),
+                    'category': e.get('category'),
+                    'description': e.get('description', '')[:200] if e.get('description') else ''
+                }
+                for e in paginated_events
+            ]
         
         return jsonify({
             'success': True,
