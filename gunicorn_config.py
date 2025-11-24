@@ -5,12 +5,13 @@ import os
 bind = f"0.0.0.0:{os.getenv('PORT', '8100')}"
 backlog = 2048
 
-workers = int(os.getenv('GUNICORN_WORKERS', min(4, (multiprocessing.cpu_count() * 2) + 1)))
+# Reduce workers - fewer workers = less memory and faster startup
+workers = int(os.getenv('GUNICORN_WORKERS', 2))  # Changed from 4 to 2
 worker_class = 'sync'
 worker_connections = 1000
-timeout = 120  # Increased from 60 to 120
+timeout = 180  # Increased for initial data load
 keepalive = 5
-graceful_timeout = 60  # Increased from 30 to 60
+graceful_timeout = 90
 
 max_requests = 1000
 max_requests_jitter = 50
@@ -20,7 +21,8 @@ errorlog = '-'
 loglevel = 'info'
 capture_output = True
 
-preload_app = False
+# CRITICAL FIX: Preload the app to initialize cache once before forking
+preload_app = True
 
 def on_starting(server):
     print("="*80)
@@ -28,13 +30,14 @@ def on_starting(server):
     print(f"   Workers: {workers}")
     print(f"   Timeout: {timeout}s")
     print(f"   Port: {os.getenv('PORT', '8100')}")
+    print(f"   Preload: {preload_app}")
     print("="*80)
 
 def when_ready(server):
-    print("✅ Trending server ready")
+    print("✅ Trending server ready - cache preloaded and shared across workers")
 
 def worker_int(worker):
     print(f"⚠️  Worker {worker.pid} shutting down gracefully")
 
 def post_worker_init(worker):
-    print(f"👷 Worker {worker.pid} initialized")
+    print(f"👷 Worker {worker.pid} initialized and using shared cache")

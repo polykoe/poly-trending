@@ -56,10 +56,10 @@ def fetch_all_trending_events() -> List[Dict]:
             print(f"[PID {os.getpid()}] ❌ Error fetching at offset {offset}: {e}", flush=True)
             return []
     
-    # FIXED: Fetch in parallel but maintain order using a dictionary
+    # Fetch in parallel but maintain order - reduced workers for stability
     offsets = list(range(0, 5000, limit))
     
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:  # Reduced from 10 to 5
         # Submit all tasks and store futures with their offset
         future_to_offset = {executor.submit(fetch_batch, offset): offset for offset in offsets}
         
@@ -75,7 +75,7 @@ def fetch_all_trending_events() -> List[Dict]:
     for offset in sorted(results.keys()):
         all_events.extend(results[offset])
         
-        # Stop when we hit an empty batch (no more events)
+        # Stop when we hit a small batch (no more events)
         if len(results[offset]) < limit:
             break
     
