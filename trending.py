@@ -587,42 +587,50 @@ def force_refresh():
         }), 500
 
 
-# ============================================
-# INITIALIZATION
-# ============================================
 def initialize_app():
-    """Initialize app - runs in both dev and production"""
+    global cached_events, last_update
+    
     print("\n" + "="*60)
-    print("🚀 MEGA FAST GRADING - COMMENT-FIRST LOGIC")
+    print("Initializing app...")
     print("="*60)
-    print(f"Config: {MAX_WORKERS} workers | {COMMENTS_PER_CHUNK} comments/chunk")
-    print(f"Filter: Liquidity > ${MIN_LIQUIDITY}")
-    print("Logic: Comment picks market+position → shares boost")
-    print("="*60 + "\n")
+    print("Fetching ALL events data...")
     
-    load_cache()
-    load_graded_comments()
+    events = get_all_trending_events()
     
-    # Only fetch top event and start background tasks in development
-    if os.environ.get('FLASK_ENV') == 'development':
-        slug = get_top_event()
-        if slug:
-            update_event(slug)
-        threading.Thread(target=background_updater, daemon=True).start()
+    if events:
+        cached_events = events
+        last_update = time.time()
+        print(f"\n✓ Successfully loaded {len(events)} events!")
+        print("="*60 + "\n")
+    else:
+        print("\n⚠ Failed to load initial data")
+        print("="*60 + "\n")
+    
+    print("Starting background thread...")
+    
+    events_thread = threading.Thread(target=update_events_background, daemon=True)
+    events_thread.start()
+    print("✓ Events background updates started\n")
 
-# Load caches on import
-load_cache()
-load_graded_comments()
+initialize_app()
 
-# Start background updater on first request (not on import)
-@app.before_request
-def start_background_tasks():
-    if not hasattr(app, 'background_started'):
-        app.background_started = True
-        threading.Thread(target=background_updater, daemon=True).start()
-
-# Development server
 if __name__ == '__main__':
-    initialize_app()
-    port = int(os.environ.get('PORT', 8400))  # ✅ USE PORT ENV VAR
-    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
+
+    
+    print("=" * 60)
+    print("🚀 Polymarket Events API Server")
+    print("=" * 60)
+    print("\nEndpoints:")
+    print("  GET  /api/events")
+    print("  GET  /api/events/featured")
+    print("  GET  /api/events/remaining")
+    print("  GET  /api/markets/paginated")
+    print("  GET  /api/market/<slug>")
+    print("  GET  /api/market/<slug>/chart")
+    print("  GET  /api/market/<slug>/related")
+    print("  GET  /api/health")
+    print("  POST /api/refresh")
+    print("\nRunning on: http://localhost:8100")
+    print("=" * 60 + "\n")
+    
+    app.run(debug=True, host='0.0.0.0', port=8100)
