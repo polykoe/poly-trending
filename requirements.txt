@@ -1,6 +1,7 @@
-gunicorn>=21.2.0
-flask
-flask-cors
-google-generativeai
+Flask
+Flask-Cors
 python-dotenv
-requests
+google-generativeai
+gunicorn
+tenacity
+Flask-Limiter
