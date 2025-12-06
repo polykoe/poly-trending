@@ -51,6 +51,7 @@ init_lock = Lock()
 
 gamma_api_url = "https://gamma-api.polymarket.com"
 clob_api_url = "https://clob.polymarket.com"
+
 def fetch_all_trending_events() -> List[Dict]:
     """Fetches all trending events maintaining volume order"""
     base_url = f"{gamma_api_url}/events"
@@ -174,7 +175,10 @@ def fetch_all_trending_events() -> List[Dict]:
             market_active = market.get('active', True)
             is_live = market_active and not market_closed
             
+            # FIXED: Added id, question, and groupItemTitle fields
             formatted_market = {
+                'id': market.get('conditionId') or market.get('id'),
+                'question': market.get('question', ''),
                 'groupItemTitle': market.get('groupItemTitle', ''),
                 'image': market.get('image') or market.get('icon') or event.get('image') or event.get('icon') or 'https://via.placeholder.com/40',
                 'outcomePrices': outcome_prices,
@@ -303,7 +307,6 @@ def get_cached_events() -> List[Dict]:
     with events_cache['lock']:
         return events_cache['data'].copy()
 
-
 @app.route('/api/events', methods=['GET'])
 def get_events():
     if not events_cache.get('initialized', False):
@@ -422,7 +425,7 @@ def get_paginated_markets():
     try:
         offset = int(request.args.get('offset', 0))
         limit = int(request.args.get('limit', 100))
-        include_markets = request.args.get('include_markets', 'true').lower() == 'true'  # Changed default to true
+        include_markets = request.args.get('include_markets', 'true').lower() == 'true'
         
         if offset < 0:
             offset = 0
@@ -582,7 +585,7 @@ def get_market_chart(slug):
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
-
+        
 @app.route('/api/market/<slug>', methods=['GET'])
 def get_market_by_slug(slug):
     """Get detailed information about a specific market by slug"""
@@ -646,6 +649,56 @@ def get_market_by_slug(slug):
             except (ValueError, TypeError):
                 liquidity = 0
         
+        # FIXED: Format markets with proper field names (same as fetch_all_trending_events)
+        formatted_markets = []
+        for market in markets:
+            # Get market liquidity
+            market_liquidity = market.get('liquidity', 0)
+            if isinstance(market_liquidity, str):
+                try:
+                    market_liquidity = float(market_liquidity)
+                except (ValueError, TypeError):
+                    market_liquidity = 0
+            
+            # Get market volume
+            market_volume = market.get('volume', 0)
+            if isinstance(market_volume, str):
+                try:
+                    market_volume = float(market_volume)
+                except (ValueError, TypeError):
+                    market_volume = 0
+            
+            # Parse outcome prices
+            outcome_prices_raw = market.get('outcomePrices', [])
+            outcome_prices = []
+            
+            if isinstance(outcome_prices_raw, str):
+                try:
+                    outcome_prices = json.loads(outcome_prices_raw)
+                except json.JSONDecodeError:
+                    outcome_prices = []
+            elif isinstance(outcome_prices_raw, list):
+                outcome_prices = outcome_prices_raw
+            
+            # Get market status
+            market_closed = market.get('closed', False)
+            market_active = market.get('active', True)
+            
+            # FIXED: Added id, question, and groupItemTitle fields
+            formatted_market = {
+                'id': market.get('conditionId') or market.get('id'),
+                'question': market.get('question', ''),
+                'groupItemTitle': market.get('groupItemTitle', ''),
+                'image': market.get('image') or market.get('icon') or event.get('image') or event.get('icon'),
+                'outcomePrices': outcome_prices,
+                'outcomes': market.get('outcomes', []),
+                'active': market_active,
+                'closed': market_closed,
+                'liquidity': str(market_liquidity),
+                'volume': str(market_volume)
+            }
+            formatted_markets.append(formatted_market)
+        
         formatted_event = {
             'id': event.get('id'),
             'title': event.get('title'),
@@ -666,9 +719,9 @@ def get_market_by_slug(slug):
             'liquidity': liquidity,
             'description': event.get('description', ''),
             'end_date': event.get('endDate'),
-            'market_count': len(markets),
+            'market_count': len(formatted_markets),
             'category': event.get('category'),
-            'markets': markets
+            'markets': formatted_markets
         }
         
         return jsonify({
